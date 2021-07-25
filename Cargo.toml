@@ -13,3 +13,9 @@ repository = "https://github.com/herblet/little-stomper"
 [dependencies]
 futures = { version = "^0.3", default-features = false, features = ["alloc"] }
 stomp-parser = { version = "^0.5", git = "https://github.com/herblet/stomp-parser", branch="main"}
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt","macros", "sync"] }
+tokio-stream = "0.1"
+stomp-test-utils = {version = "0.2", path="../stomp-test-utils" }
+sender-sink = "0.2"
