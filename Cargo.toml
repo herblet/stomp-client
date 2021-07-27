@@ -12,10 +12,29 @@ repository = "https://github.com/herblet/little-stomper"
 
 [dependencies]
 futures = { version = "^0.3", default-features = false, features = ["alloc"] }
-stomp-parser = { version = "^0.5", git = "https://github.com/herblet/stomp-parser", branch="main"}
+stomp-parser = { version = "^0.5", git = "https://github.com/herblet/stomp-parser", branch="main" }
+log = "0.4"
+
+[target.'cfg(target_arch="wasm32")'.dependencies]
+async_executors = { version = "0.4", features = ["bindgen"]}
+
+[target.'cfg(not(target_arch="wasm32"))'.dependencies]
+async_executors = { version = "0.4", features = ["async_global_tokio"]}
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt","macros", "sync"] }
-tokio-stream = "0.1"
 stomp-test-utils = {version = "0.2", path="../stomp-test-utils" }
+tokio-stream = "0.1"
 sender-sink = "0.2"
+
+[target.'cfg(target_arch="wasm32")'.dev-dependencies]
+wasm-bindgen-test = { version="0.3" }
+
+[target.'cfg(not(target_arch="wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["rt","macros", "sync"] }
+
+#[features]
+#default=["stomp-client-tokio"]
+#stomp-client-wasm = []
+#stomp-client-tokio = ["async_executors/async_global_tokio"]
+
+
