@@ -23,3 +23,13 @@ impl From<StompParseError> for StompClientError {
         StompClientError::new(cause.message())
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+use sender_sink::wrappers::SinkError;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<SinkError> for StompClientError {
+    fn from(source: SinkError) -> Self {
+        StompClientError::new(format!("{:?}", source))
+    }
+}

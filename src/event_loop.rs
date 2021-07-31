@@ -1,31 +1,51 @@
 use std::{
+    collections::HashMap,
     convert::{TryFrom, TryInto},
+    fmt::Debug,
     pin::Pin,
 };
 
-use async_executors::SpawnHandleExt;
 use futures::{
-    channel::mpsc::{unbounded, UnboundedReceiver},
     future::ready,
-    stream::{empty, select_all, BoxStream},
-    task::{LocalSpawn, SpawnExt},
+    stream::{empty, once, select_all, BoxStream},
     Future, FutureExt, Sink, SinkExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
-use stomp_parser::{
-    client::{ClientFrame, ConnectFrameBuilder},
-    headers::{StompVersion, StompVersions},
-    server::ServerFrame,
-};
+use stomp_parser::{client::*, headers::*, server::*};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::{error::StompClientError, session::StompClientSession};
+use crate::{error::StompClientError, session::StompClientSession, spawn};
 
 pub type BytesStream = BoxStream<'static, Result<Vec<u8>, StompClientError>>;
 pub type BytesSink = Pin<Box<dyn Sink<Vec<u8>, Error = StompClientError> + Sync + Send + 'static>>;
 
+pub struct DestinationId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SubscriptionId(pub String);
+
 pub enum SessionEvent {
+    Subscribe(DestinationId, UnboundedSender<MessageFrame>),
+    Unsubscribe(SubscriptionId),
+    Send(DestinationId, Vec<u8>),
     ServerFrame(Result<ServerFrame, StompClientError>),
     ServerHeartBeat,
     Close,
+    Disconnected,
+}
+
+impl Debug for SessionEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Subscribe(_, _) => "Subscribe",
+            Self::Unsubscribe(_) => "Unsubscribe",
+            Self::Send(_, _) => "Send",
+            Self::ServerFrame(_) => "ServerFrame",
+            Self::ServerHeartBeat => "ServerHeartBeat",
+            Self::Close => "Close",
+            Self::Disconnected => "Disconnected",
+        })
+    }
 }
 pub enum SessionState {
     Alive,
@@ -41,29 +61,49 @@ type EventResult = Result<(SessionState, Option<MessageToServer>), StompClientEr
 
 type EventResultFuture = Pin<Box<dyn Future<Output = EventResult> + Send + 'static>>;
 
-pub struct SessionEventLoop {}
+pub struct SessionEventLoop {
+    client_event_sender: UnboundedSender<SessionEvent>,
+    subscriptions: HashMap<SubscriptionId, UnboundedSender<MessageFrame>>,
+}
+
+async fn perform_handshake(
+    host_id: String,
+    stream_from_server: &mut BytesStream,
+    sink_to_server: &mut BytesSink,
+) -> Result<(), StompClientError> {
+    sink_to_server.send(connect_frame(host_id)).await?;
+
+    match stream_from_server.next().await {
+        None => Err(StompClientError::new(
+            "Stream from server ended before handshake",
+        )),
+        Some(Err(client_err)) => Err(client_err),
+        Some(Ok(bytes)) => validate_handshake(Some(bytes)),
+    }
+}
 
 impl SessionEventLoop {
-    fn new() -> SessionEventLoop {
-        SessionEventLoop {}
+    fn new(client_event_sender: UnboundedSender<SessionEvent>) -> SessionEventLoop {
+        SessionEventLoop {
+            client_event_sender,
+            subscriptions: HashMap::new(),
+        }
     }
 
     pub async fn start(
         host_id: String,
-        stream_from_server: BytesStream,
+        mut stream_from_server: BytesStream,
         mut sink_to_server: BytesSink,
     ) -> Result<StompClientSession, StompClientError> {
-        let remaining_stream = sink_to_server
-            .send(connect_frame(host_id))
-            .and_then(|_| head(stream_from_server))
-            .and_then(move |(first, remaining_stream)| async {
-                validate_handshake(first).map(|_| remaining_stream)
-            })
-            .await?;
+        perform_handshake(host_id, &mut stream_from_server, &mut &mut sink_to_server).await?;
+        // the handshake complete succressfully!
 
-        let stream_from_server = create_server_event_stream(remaining_stream);
+        let stream_from_server = create_server_event_stream(stream_from_server);
 
-        let (client_event_sender, stream_from_client) = unbounded();
+        let (client_event_sender, stream_from_client) = unbounded_channel();
+
+        let stream_from_client = UnboundedReceiverStream::new(stream_from_client)
+            .chain(once(ready(SessionEvent::Close)));
 
         let client_heartbeat_stream = empty();
 
@@ -71,10 +111,13 @@ impl SessionEventLoop {
             stream_from_client.boxed(),
             stream_from_server.boxed(),
             client_heartbeat_stream.boxed(),
-        ]);
+        ])
+        .inspect(|item| {
+            log::debug!("Event: {:?}", item);
+        });
 
         let event_handler = {
-            let mut session = SessionEventLoop::new();
+            let mut session = SessionEventLoop::new(client_event_sender.clone());
 
             // client_session.start_heartbeat_listener(client_heartbeat_stream);
 
@@ -87,16 +130,12 @@ impl SessionEventLoop {
                 log::debug!("Response");
             })
             .inspect_err(Self::log_error)
-            .take_while(Self::not_dead);
+            .take_while(Self::not_dead)
+            .filter_map(Self::into_opt_ok_of_bytes)
+            .forward(sink_to_server)
+            .map(|_| ());
 
-        crate::executor()
-            .spawn(
-                response_stream
-                    .filter_map(Self::into_opt_ok_of_bytes)
-                    .forward(sink_to_server)
-                    .map(|_| ()),
-            )
-            .expect("Event loop init failed");
+        spawn(response_stream);
 
         Ok(StompClientSession::new(client_event_sender))
     }
@@ -131,14 +170,136 @@ impl SessionEventLoop {
         ready(!matches!(event_result, Ok((SessionState::Dead, _))))
     }
 
+    fn subscribe(
+        &mut self,
+        destination: DestinationId,
+        sender: UnboundedSender<MessageFrame>,
+    ) -> EventResult {
+        let subscription_id = SubscriptionId(self.subscriptions.len().to_string());
+
+        self.start_subscription_end_listener(sender.clone(), subscription_id.clone());
+
+        log::info!(
+            "Subscribing to destination '{:?}' with id '{:?}'",
+            &destination.0,
+            &subscription_id
+        );
+
+        let message_to_server = MessageToServer::ClientFrame(ClientFrame::Subscribe(
+            SubscribeFrameBuilder::new(destination.0, subscription_id.0.clone()).build(),
+        ));
+
+        self.subscriptions.insert(subscription_id, sender);
+
+        Ok((SessionState::Alive, Some(message_to_server)))
+    }
+
+    fn start_subscription_end_listener(
+        &self,
+        sender: UnboundedSender<MessageFrame>,
+        subscription: SubscriptionId,
+    ) {
+        let client_event_sender = self.client_event_sender.clone();
+        spawn(async move {
+            sender.closed().await;
+            if let Err(err) = client_event_sender.send(SessionEvent::Unsubscribe(subscription)) {
+                log::error!("Unable to unsubscribe, event-loop dead? Error: {:?}", err);
+            }
+        });
+    }
+
+    fn unsubscribe(&mut self, subscription: SubscriptionId) -> EventResult {
+        match self.subscriptions.remove(&subscription) {
+            Some(_) => {
+                let message_to_server = MessageToServer::ClientFrame(ClientFrame::Unsubscribe(
+                    UnsubscribeFrameBuilder::new(subscription.0.clone()).build(),
+                ));
+                Ok((SessionState::Alive, Some(message_to_server)))
+            }
+            None => Err(StompClientError::new(format!(
+                "Tried to remove missing subscription {:?}",
+                subscription,
+            ))),
+        }
+    }
+
+    fn send(&mut self, destination: DestinationId, content: Vec<u8>) -> EventResult {
+        let message_to_server = MessageToServer::ClientFrame(ClientFrame::Send(
+            SendFrameBuilder::new(destination.0).body(content).build(),
+        ));
+        Ok((SessionState::Alive, Some(message_to_server)))
+    }
+
+    fn handle_server_frame(&mut self, server_frame: ServerFrame) -> EventResultFuture {
+        log::info!("Handling server frame.");
+        match server_frame {
+            ServerFrame::Message(message_frame) => ready(self.forward_message(message_frame))
+                .map_ok(|()| (SessionState::Alive, None))
+                .boxed(),
+            _ => todo!(),
+        }
+    }
+
+    fn forward_message(&mut self, message_frame: MessageFrame) -> Result<(), StompClientError> {
+        self.subscriptions
+            .get(&SubscriptionId(
+                message_frame.subscription.value().to_owned(),
+            ))
+            .ok_or_else(|| {
+                StompClientError::new(format!(
+                    "Received message for unknown subscription {}",
+                    message_frame.subscription.value()
+                ))
+            })
+            .and_then(|sender_for_sub| {
+                sender_for_sub.send(message_frame).map_err(|err| {
+                    StompClientError::new(format!("error sending message to handler: {}", err))
+                })
+            })
+    }
+
     fn handle_event(&mut self, event: SessionEvent) -> EventResultFuture {
-        todo!()
+        match event {
+            SessionEvent::Subscribe(destination, message_sender) => {
+                ready(self.subscribe(destination, message_sender)).boxed()
+            }
+
+            SessionEvent::Unsubscribe(subscription_id) => {
+                ready(self.unsubscribe(subscription_id)).boxed()
+            }
+
+            SessionEvent::Send(destination, content) => {
+                ready(self.send(destination, content)).boxed()
+            }
+
+            SessionEvent::ServerFrame(Ok(server_frame)) => self.handle_server_frame(server_frame),
+
+            SessionEvent::ServerFrame(Err(error)) => {
+                log::error!("Error processing message from server: {:?}", error);
+                ready(Err(error)).boxed()
+            }
+
+            SessionEvent::Close => {
+                log::info!("Session closed by client.");
+                ready(Ok((SessionState::Dead, None))).boxed()
+            }
+
+            SessionEvent::Disconnected => {
+                log::error!("Connection dropped by server.");
+                ready(Ok((SessionState::Dead, None))).boxed()
+            }
+
+            ev => {
+                log::info!("Unknown event received: {:?}", ev);
+                todo!()
+            }
+        }
     }
 }
 
 fn create_server_event_stream(raw_stream: BytesStream) -> impl Stream<Item = SessionEvent> {
     // Closes this session; will be chained to client stream to run after that ends
-    let close_stream = futures::stream::once(async { SessionEvent::Close }).boxed();
+    let close_stream = once(async { SessionEvent::Disconnected }).boxed();
 
     raw_stream
         .and_then(|bytes| parse_server_message(bytes).boxed())
@@ -188,72 +349,11 @@ fn validate_handshake(response: Option<Vec<u8>>) -> Result<(), StompClientError>
     }
 }
 
-fn head(
-    stream_from_server: Pin<Box<dyn Stream<Item = Result<Vec<u8>, StompClientError>> + Send>>,
-) -> impl Future<
-    Output = Result<
-        (
-            Option<Vec<u8>>,
-            Pin<Box<dyn Stream<Item = Result<Vec<u8>, StompClientError>> + Send>>,
-        ),
-        StompClientError,
-    >,
-> {
-    stream_from_server
-        .into_future()
-        .map(|(first_res, remainder)| first_res.transpose().map(|bytes| (bytes, remainder)))
-}
-
 fn connect_frame(host_id: String) -> Vec<u8> {
     ConnectFrameBuilder::new(host_id, StompVersions(vec![StompVersion::V1_2]))
         .build()
         .try_into()
         .unwrap()
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-    use futures::sink::SinkExt;
-    use futures::stream::StreamExt;
-    use futures::TryFutureExt;
-    use sender_sink::wrappers::SinkError;
-    use sender_sink::wrappers::UnboundedSenderSink;
-    use std::convert::TryFrom;
-    use stomp_parser::client::*;
-    use stomp_parser::server::*;
-    use stomp_test_utils::*;
-    use tokio_stream::wrappers::UnboundedReceiverStream;
-
-    impl From<SinkError> for StompClientError {
-        fn from(source: SinkError) -> Self {
-            StompClientError::new(format!("{:?}", source))
-        }
-    }
-
-    fn session_factory(
-        in_receiver: InReceiver<StompClientError>,
-        out_sender: OutSender,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StompClientError>> + Send>> {
-        SessionEventLoop::start(
-            "test".to_owned(),
-            UnboundedReceiverStream::new(in_receiver).boxed(),
-            Box::pin(UnboundedSenderSink::from(out_sender).sink_err_into::<StompClientError>()),
-        )
-        .map_ok(|_session| ())
-        .boxed()
-    }
-    #[tokio::test]
-    async fn it_works() {
-        assert_behaviour(
-            session_factory,
-            receive(|bytes| matches!(ClientFrame::try_from(bytes), Ok(ClientFrame::Connect(_))))
-                .then(send(ServerFrame::Connected(
-                    ConnectedFrameBuilder::new(StompVersion::V1_2).build(),
-                ))),
-        )
-        .await;
-    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

@@ -1,36 +1,29 @@
-use async_executors::{SpawnHandle, YieldNow};
-use futures::task::Spawn;
-
 pub mod error;
 
-mod event_loop;
+pub mod event_loop;
 pub mod session;
-
-pub trait StompClientExecutor: SpawnHandle<()> + Spawn + YieldNow + Clone {}
-
-impl<T: SpawnHandle<()> + Spawn + YieldNow + Clone> StompClientExecutor for T {}
 
 #[cfg(target_arch = "wasm32")]
 pub mod stomp_client_wasm {
-    use super::StompClientExecutor;
-    use async_executors::exec::Bindgen;
+    use std::future::Future;
 
-    pub fn executor() -> impl StompClientExecutor {
-        Bindgen::new()
+    use crate::error::StompClientError;
+
+    pub fn spawn<F: Future<Output = ()> + Send + 'static>(task: F) {
+        wasm_bindgen_futures::futures_0_3::spawn_local(task);
     }
 }
 #[cfg(target_arch = "wasm32")]
-pub use stomp_client_wasm::executor;
+pub use stomp_client_wasm::spawn;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stomp_client_tokio {
-    use super::StompClientExecutor;
-    use async_executors::exec::AsyncGlobal;
+    use std::future::Future;
 
-    pub fn executor() -> impl StompClientExecutor {
-        AsyncGlobal::new()
+    pub fn spawn<F: Future<Output = ()> + Send + 'static>(task: F) {
+        tokio::task::spawn(task);
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use stomp_client_tokio::executor;
+pub use stomp_client_tokio::spawn;

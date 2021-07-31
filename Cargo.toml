@@ -11,26 +11,33 @@ repository = "https://github.com/herblet/little-stomper"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+tokio = { version="1",default-features = false, features = ["sync"] }
+tokio-stream = "0.1"
 futures = { version = "^0.3", default-features = false, features = ["alloc"] }
 stomp-parser = { version = "^0.5", git = "https://github.com/herblet/stomp-parser", branch="main" }
+sender-sink = "0.2"
 log = "0.4"
 
 [target.'cfg(target_arch="wasm32")'.dependencies]
-async_executors = { version = "0.4", features = ["bindgen"]}
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = {version="0.3", features=["futures_0_3"]}
+
+#async_executors = { version = "0.4", features = ["bindgen"]}
 
 [target.'cfg(not(target_arch="wasm32"))'.dependencies]
-async_executors = { version = "0.4", features = ["async_global_tokio"]}
+tokio = { version = "1", features = ["rt"] }
+#async_executors = { version = "0.4", features = ["async_global_tokio"]}
 
 [dev-dependencies]
 stomp-test-utils = {version = "0.2", path="../stomp-test-utils" }
-tokio-stream = "0.1"
-sender-sink = "0.2"
+tokio = { version = "1", features = ["macros"] }
 
 [target.'cfg(target_arch="wasm32")'.dev-dependencies]
 wasm-bindgen-test = { version="0.3" }
 
 [target.'cfg(not(target_arch="wasm32"))'.dev-dependencies]
-tokio = { version = "1", features = ["rt","macros", "sync"] }
+env_logger = "0.8"
+
 
 #[features]
 #default=["stomp-client-tokio"]
